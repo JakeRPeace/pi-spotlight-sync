@@ -1,0 +1,48 @@
+{
+  "name": "pi-spotlight-sync",
+  "version": "0.1.0",
+  "description": "Mirror a pi worktree into a repository root for one-root testing.",
+  "license": "MIT",
+  "author": "Jake Peace",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JakeRPeace/pi-spotlight-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JakeRPeace/pi-spotlight-sync/issues"
+  },
+  "homepage": "https://github.com/JakeRPeace/pi-spotlight-sync#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "worktree",
+    "git",
+    "spotlight"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.76.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
