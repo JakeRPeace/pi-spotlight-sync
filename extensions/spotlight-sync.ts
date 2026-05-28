@@ -240,6 +240,16 @@ async function aheadCommitCount(
   return Number.isFinite(count) ? count : undefined;
 }
 
+async function stateAheadCommitCount(
+  pi: ExtensionAPI,
+  state: SpotlightState,
+): Promise<number | undefined> {
+  return (
+    state.aheadCommitCount ??
+    (await aheadCommitCount(pi, state.activeSource, state.baseRef ?? DEFAULT_BASE_REF))
+  );
+}
+
 async function copyTrackedChanges(
   pi: ExtensionAPI,
   sourceRoot: string,
@@ -392,10 +402,18 @@ function statusText(session: SpotlightSession | undefined): string {
   return details.join('\n');
 }
 
-function stateStatusText(state: SpotlightState, rootPath: string): string {
+function stateStatusText(
+  state: SpotlightState,
+  rootPath: string,
+  currentAheadCommitCount?: number,
+): string {
   const lastSyncedAt = stateLastSyncedAt(state);
   const details = [
-    `Spotlight sync is active${statusSuffix(state.changedFileCount, lastSyncedAt, state.aheadCommitCount)}.`,
+    `Spotlight sync is active${statusSuffix(
+      state.changedFileCount,
+      lastSyncedAt,
+      currentAheadCommitCount ?? state.aheadCommitCount,
+    )}.`,
     `source: ${state.activeSource}`,
     `root: ${rootPath}`,
     `base: ${state.baseRef ?? DEFAULT_BASE_REF}`,
@@ -495,12 +513,13 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
         return;
       }
 
+      const currentAheadCommitCount = await stateAheadCommitCount(pi, state);
       setSpotlightStatus(
         ctx,
         state.activeSource === sourceRoot ? 'flashing' : 'borrowed',
         state.changedFileCount,
         stateLastSyncedAt(state),
-        state.aheadCommitCount,
+        currentAheadCommitCount,
       );
     } catch {
       setSpotlightStatus(ctx, 'off');
@@ -524,7 +543,11 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
         ? resolve(ctx.cwd, rootPath)
         : await findDefaultRoot(pi, sourceRoot);
       const state = await readState(await getStatePath(pi, statusRoot));
-      ctx.ui.notify(state ? stateStatusText(state, statusRoot) : 'Spotlight sync is off.', 'info');
+      const currentAheadCommitCount = state ? await stateAheadCommitCount(pi, state) : undefined;
+      ctx.ui.notify(
+        state ? stateStatusText(state, statusRoot, currentAheadCommitCount) : 'Spotlight sync is off.',
+        'info',
+      );
       return;
     }
 
@@ -544,12 +567,13 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
       }
 
       if (state.activeSource !== sourceRoot) {
+        const currentAheadCommitCount = await stateAheadCommitCount(pi, state);
         setSpotlightStatus(
           ctx,
           'borrowed',
           state.changedFileCount,
           stateLastSyncedAt(state),
-          state.aheadCommitCount,
+          currentAheadCommitCount,
         );
         ctx.ui.notify(
           `Spotlight sync is active from another worktree:\n${state.activeSource}`,
@@ -599,12 +623,13 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
     const statePath = await getStatePath(pi, destinationRoot);
     const currentState = await readState(statePath);
     if (currentState && currentState.activeSource !== sourceRoot) {
+      const currentAheadCommitCount = await stateAheadCommitCount(pi, currentState);
       setSpotlightStatus(
         ctx,
         'borrowed',
         currentState.changedFileCount,
         stateLastSyncedAt(currentState),
-        currentState.aheadCommitCount,
+        currentAheadCommitCount,
       );
       ctx.ui.notify(
         `Spotlight sync is already active from another worktree:\n${currentState.activeSource}`,
