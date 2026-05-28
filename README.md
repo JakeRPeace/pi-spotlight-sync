@@ -1,6 +1,6 @@
 # pi-spotlight-sync
 
-A [pi](https://pi.dev/) extension that mirrors changes from a linked Git worktree into the repository root so tools that only work from one root can run against your active pi changes.
+A [pi](https://pi.dev/) extension that mirrors changes from the current linked Git worktree into the base repository root so tools that only work from one root can run against your active pi changes.
 
 ## Install
 
@@ -17,10 +17,10 @@ pi install git:github.com/JakeRPeace/pi-spotlight-sync@main
 ## Commands
 
 ```bash
-/beam on [root-path] [--interval=1500] [--base=origin/main]
-/beam update [root-path] [--base=origin/main]
-/beam status [root-path]
-/beam off [root-path]
+/beam on [base-root-path] [--interval=1500] [--base=origin/main]
+/beam update [base-root-path] [--base=origin/main]
+/beam status [base-root-path]
+/beam off [base-root-path]
 ```
 
 Aliases:
@@ -46,11 +46,12 @@ Example:
 
 This extension is intentionally conservative, but it runs Git commands that change the destination worktree:
 
+- The destination root defaults to the base repository root from `git rev-parse --git-common-dir`.
 - The destination root is reset with `git reset --hard` and checked out at the source worktree `HEAD`.
 - Tracked file changes from the source worktree are copied into the destination root.
 - The extension refuses to start if the destination root has tracked changes and no active spotlight state exists.
-- If another worktree already owns the destination root, the extension blocks instead of taking it over.
-- Use `/beam off` to restore the destination root to the branch and commit it had before spotlight sync started.
+- Running `/beam on` from another linked worktree switches the destination root to that worktree's state.
+- Use `/beam off` from the active source worktree to restore the destination root to the branch and commit it had before spotlight sync started.
 
 Untracked files in the destination root are not removed.
 

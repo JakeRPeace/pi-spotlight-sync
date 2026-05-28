@@ -1,5 +1,5 @@
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -190,9 +190,26 @@ async function findDefaultRoot(pi: ExtensionAPI, sourceRoot: string): Promise<st
   const worktreeOutput = await git(pi, sourceRoot, ['worktree', 'list', '--porcelain']);
   const worktrees = parseWorktrees(worktreeOutput).filter((entry) => !entry.bare);
   const normalizedSource = resolve(sourceRoot);
+  const commonGitDir = await git(pi, sourceRoot, [
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-common-dir',
+  ]);
+  const baseRoot = basename(commonGitDir) === '.git' ? dirname(commonGitDir) : undefined;
+  if (baseRoot) {
+    if (resolve(baseRoot) === normalizedSource) {
+      throw new Error('Run /spotlight from a linked worktree, not the base repository root.');
+    }
+
+    const baseWorktree = worktrees.find((entry) => resolve(entry.path) === resolve(baseRoot));
+    if (baseWorktree) {
+      return baseWorktree.path;
+    }
+  }
+
   const rootCandidates = worktrees.filter((entry) => resolve(entry.path) !== normalizedSource);
-  if (rootCandidates.length === 0) {
-    throw new Error('No repository root worktree found. Pass /spotlight on /path/to/root.');
+  if (rootCandidates.length === 1) {
+    return rootCandidates[0].path;
   }
 
   const mainRoot = rootCandidates.find((entry) => branchName(entry.branch) === 'main');
@@ -200,11 +217,12 @@ async function findDefaultRoot(pi: ExtensionAPI, sourceRoot: string): Promise<st
     return mainRoot.path;
   }
 
-  if (rootCandidates.length === 1) {
-    return rootCandidates[0].path;
+  const primaryWorktree = worktrees.find((entry) => resolve(entry.path) !== normalizedSource);
+  if (primaryWorktree) {
+    return primaryWorktree.path;
   }
 
-  throw new Error('Multiple linked worktrees found. Pass /spotlight on /path/to/root.');
+  throw new Error('Could not identify the base repository root. Pass /spotlight on /path/to/root.');
 }
 
 async function changedTrackedPaths(
@@ -591,7 +609,7 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
 
     if (action !== 'on' && action !== 'start' && action !== 'sync' && action !== 'update') {
       ctx.ui.notify(
-        'Usage: /beam on [root-path] [--interval=1500] [--base=origin/main], /beam update [root-path], /beam off, /beam status',
+        'Usage: /beam on [base-root-path] [--interval=1500] [--base=origin/main], /beam update [base-root-path], /beam off, /beam status',
         'error',
       );
       return;
@@ -622,22 +640,6 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
 
     const statePath = await getStatePath(pi, destinationRoot);
     const currentState = await readState(statePath);
-    if (currentState && currentState.activeSource !== sourceRoot) {
-      const currentAheadCommitCount = await stateAheadCommitCount(pi, currentState);
-      setSpotlightStatus(
-        ctx,
-        'borrowed',
-        currentState.changedFileCount,
-        stateLastSyncedAt(currentState),
-        currentAheadCommitCount,
-      );
-      ctx.ui.notify(
-        `Spotlight sync is already active from another worktree:\n${currentState.activeSource}`,
-        'error',
-      );
-      return;
-    }
-
     const dirtyRootPaths = await dirtyTrackedPaths(pi, destinationRoot);
     if (!currentState && dirtyRootPaths.length > 0) {
       setSpotlightStatus(ctx, 'blocked');
