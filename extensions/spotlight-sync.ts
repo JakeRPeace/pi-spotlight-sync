@@ -1,3 +1,4 @@
+import { watch, type FSWatcher } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type {
@@ -41,7 +42,11 @@ interface SpotlightSession {
   rootPath: string;
   statePath: string;
   baseRef: string;
-  timer?: ReturnType<typeof setInterval>;
+  watcher?: FSWatcher;
+  debounceTimer?: ReturnType<typeof setTimeout>;
+  statusRefreshTimer?: ReturnType<typeof setInterval>;
+  syncInFlight?: boolean;
+  pendingSync?: boolean;
   lastError?: string;
   changedFileCount?: number;
   aheadCommitCount?: number;
@@ -80,10 +85,13 @@ function parseArgs(args: string): {
   const action = parts[0] ?? 'status';
   const rootPath = parts.find((part) => part.startsWith('/') || part.startsWith('.'));
   const intervalArg = parts.find((part) => part.startsWith('--interval='));
+  const debounceArg = parts.find((part) => part.startsWith('--debounce='));
   const baseArg = parts.find((part) => part.startsWith('--base='));
-  const intervalMs = intervalArg
-    ? Number(intervalArg.slice('--interval='.length))
-    : DEFAULT_INTERVAL_MS;
+  const intervalMs = debounceArg
+    ? Number(debounceArg.slice('--debounce='.length))
+    : intervalArg
+      ? Number(intervalArg.slice('--interval='.length))
+      : DEFAULT_INTERVAL_MS;
 
   return {
     action,
@@ -340,9 +348,19 @@ async function syncNow(
 }
 
 function stopSession(session?: SpotlightSession): void {
-  if (session?.timer) {
-    clearInterval(session.timer);
-    session.timer = undefined;
+  if (session?.debounceTimer) {
+    clearTimeout(session.debounceTimer);
+    session.debounceTimer = undefined;
+  }
+
+  if (session?.statusRefreshTimer) {
+    clearInterval(session.statusRefreshTimer);
+    session.statusRefreshTimer = undefined;
+  }
+
+  if (session?.watcher) {
+    session.watcher.close();
+    session.watcher = undefined;
   }
 }
 
@@ -442,6 +460,17 @@ function stateStatusText(
   return details.join('\n');
 }
 
+function shouldIgnoreWatchedPath(filename: string | Buffer | null): boolean {
+  if (!filename) {
+    return true;
+  }
+
+  const pathParts = filename.toString().split(/[\\/]/);
+  return pathParts.some((part) =>
+    ['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '.turbo'].includes(part),
+  );
+}
+
 export default function spotlightSyncExtension(pi: ExtensionAPI): void {
   let session: SpotlightSession | undefined;
   let clearFlashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -510,7 +539,7 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    if (session?.timer) {
+    if (session?.watcher) {
       setSpotlightStatus(
         ctx,
         'beaming',
@@ -541,6 +570,63 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
       );
     } catch {
       setSpotlightStatus(ctx, 'off');
+    }
+  }
+
+  function scheduleSpotlightSync(
+    ctx: ExtensionContext,
+    activeSession: SpotlightSession,
+    debounceMs: number,
+  ): void {
+    if (activeSession.debounceTimer) {
+      clearTimeout(activeSession.debounceTimer);
+    }
+
+    activeSession.debounceTimer = setTimeout(() => {
+      activeSession.debounceTimer = undefined;
+      void runSpotlightSync(ctx, activeSession);
+    }, debounceMs);
+  }
+
+  async function runSpotlightSync(
+    ctx: ExtensionContext,
+    activeSession: SpotlightSession,
+  ): Promise<void> {
+    if (activeSession.syncInFlight) {
+      activeSession.pendingSync = true;
+      return;
+    }
+
+    activeSession.syncInFlight = true;
+    try {
+      do {
+        activeSession.pendingSync = false;
+        await syncNow(pi, activeSession);
+        if (session !== activeSession) {
+          break;
+        }
+
+        setSpotlightStatus(
+          ctx,
+          'beaming',
+          activeSession.changedFileCount,
+          activeSession.lastSyncedAt,
+          activeSession.aheadCommitCount,
+        );
+      } while (activeSession.pendingSync && session === activeSession);
+    } catch (error: unknown) {
+      if (session === activeSession) {
+        activeSession.lastError = error instanceof Error ? error.message : String(error);
+        setSpotlightStatus(
+          ctx,
+          'blocked',
+          activeSession.changedFileCount,
+          activeSession.lastSyncedAt,
+          activeSession.aheadCommitCount,
+        );
+      }
+    } finally {
+      activeSession.syncInFlight = false;
     }
   }
 
@@ -609,7 +695,7 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
 
     if (action !== 'on' && action !== 'start' && action !== 'sync' && action !== 'update') {
       ctx.ui.notify(
-        'Usage: /beam on [base-root-path] [--interval=1500] [--base=origin/main], /beam update [base-root-path], /beam off, /beam status',
+        'Usage: /beam on [base-root-path] [--debounce=1500] [--base=origin/main], /beam update [base-root-path], /beam off, /beam status',
         'error',
       );
       return;
@@ -665,41 +751,59 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
     await syncNow(pi, session, true);
 
     if (!isOneShotUpdate) {
-      session.timer = setInterval(() => {
-        const activeSession = session;
-        if (!activeSession) {
-          return;
-        }
+      try {
+        session.watcher = watch(sourceRoot, { recursive: true }, (_eventType, filename) => {
+          const activeSession = session;
+          if (!activeSession || shouldIgnoreWatchedPath(filename)) {
+            return;
+          }
 
-        syncNow(pi, activeSession)
-          .then(() => {
-            if (session !== activeSession) {
-              return;
-            }
+          scheduleSpotlightSync(ctx, activeSession, intervalMs);
+        });
+        session.watcher.on('error', (error: Error) => {
+          const activeSession = session;
+          if (!activeSession) {
+            return;
+          }
 
-            setSpotlightStatus(
-              ctx,
-              'beaming',
-              activeSession.changedFileCount,
-              activeSession.lastSyncedAt,
-              activeSession.aheadCommitCount,
-            );
-          })
-          .catch((error: unknown) => {
-            if (session !== activeSession) {
-              return;
-            }
+          activeSession.lastError = error.message;
+          setSpotlightStatus(
+            ctx,
+            'blocked',
+            activeSession.changedFileCount,
+            activeSession.lastSyncedAt,
+            activeSession.aheadCommitCount,
+          );
+        });
+        session.statusRefreshTimer = setInterval(() => {
+          const activeSession = session;
+          if (!activeSession || activeSession.lastError) {
+            return;
+          }
 
-            activeSession.lastError = error instanceof Error ? error.message : String(error);
-            setSpotlightStatus(
-              ctx,
-              'blocked',
-              activeSession.changedFileCount,
-              activeSession.lastSyncedAt,
-              activeSession.aheadCommitCount,
-            );
-          });
-      }, intervalMs);
+          setSpotlightStatus(
+            ctx,
+            'beaming',
+            activeSession.changedFileCount,
+            activeSession.lastSyncedAt,
+            activeSession.aheadCommitCount,
+          );
+        }, 1_000);
+      } catch (error: unknown) {
+        session.lastError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    if (session.lastError) {
+      setSpotlightStatus(
+        ctx,
+        'blocked',
+        session.changedFileCount,
+        session.lastSyncedAt,
+        session.aheadCommitCount,
+      );
+      ctx.ui.notify(`Spotlight sync could not watch files: ${session.lastError}`, 'error');
+      return;
     }
 
     if (isOneShotUpdate) {
