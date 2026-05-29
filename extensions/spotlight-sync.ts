@@ -630,6 +630,83 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function startSpotlightWatcher(
+    ctx: ExtensionContext,
+    activeSession: SpotlightSession,
+    debounceMs: number,
+  ): void {
+    try {
+      activeSession.watcher = watch(activeSession.sourceRoot, { recursive: true }, (_eventType, filename) => {
+        if (session !== activeSession || shouldIgnoreWatchedPath(filename)) {
+          return;
+        }
+
+        scheduleSpotlightSync(ctx, activeSession, debounceMs);
+      });
+      activeSession.watcher.on('error', (error: Error) => {
+        if (session !== activeSession) {
+          return;
+        }
+
+        activeSession.lastError = error.message;
+        setSpotlightStatus(
+          ctx,
+          'blocked',
+          activeSession.changedFileCount,
+          activeSession.lastSyncedAt,
+          activeSession.aheadCommitCount,
+        );
+      });
+      activeSession.statusRefreshTimer = setInterval(() => {
+        if (session !== activeSession || activeSession.lastError) {
+          return;
+        }
+
+        setSpotlightStatus(
+          ctx,
+          'beaming',
+          activeSession.changedFileCount,
+          activeSession.lastSyncedAt,
+          activeSession.aheadCommitCount,
+        );
+      }, 1_000);
+    } catch (error: unknown) {
+      activeSession.lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function restoreActiveSpotlightSession(ctx: ExtensionContext): Promise<void> {
+    if (session) {
+      return;
+    }
+
+    const sourceRoot = await git(pi, ctx.cwd, ['rev-parse', '--show-toplevel']);
+    const rootPath = await findDefaultRoot(pi, sourceRoot);
+    const statePath = await getStatePath(pi, rootPath);
+    const state = await readState(statePath);
+    if (!state || state.activeSource !== sourceRoot) {
+      return;
+    }
+
+    session = {
+      sourceRoot,
+      rootPath,
+      statePath,
+      baseRef: state.baseRef ?? DEFAULT_BASE_REF,
+      changedFileCount: state.changedFileCount,
+      aheadCommitCount: state.aheadCommitCount,
+      changeSignature: state.changeSignature,
+      lastSyncedAt: stateLastSyncedAt(state),
+    };
+
+    await runSpotlightSync(ctx, session);
+    if (session?.lastError) {
+      return;
+    }
+
+    startSpotlightWatcher(ctx, session, DEFAULT_INTERVAL_MS);
+  }
+
   async function handleSpotlightCommand(
     args: string,
     ctx: ExtensionCommandContext,
@@ -751,47 +828,7 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
     await syncNow(pi, session, true);
 
     if (!isOneShotUpdate) {
-      try {
-        session.watcher = watch(sourceRoot, { recursive: true }, (_eventType, filename) => {
-          const activeSession = session;
-          if (!activeSession || shouldIgnoreWatchedPath(filename)) {
-            return;
-          }
-
-          scheduleSpotlightSync(ctx, activeSession, intervalMs);
-        });
-        session.watcher.on('error', (error: Error) => {
-          const activeSession = session;
-          if (!activeSession) {
-            return;
-          }
-
-          activeSession.lastError = error.message;
-          setSpotlightStatus(
-            ctx,
-            'blocked',
-            activeSession.changedFileCount,
-            activeSession.lastSyncedAt,
-            activeSession.aheadCommitCount,
-          );
-        });
-        session.statusRefreshTimer = setInterval(() => {
-          const activeSession = session;
-          if (!activeSession || activeSession.lastError) {
-            return;
-          }
-
-          setSpotlightStatus(
-            ctx,
-            'beaming',
-            activeSession.changedFileCount,
-            activeSession.lastSyncedAt,
-            activeSession.aheadCommitCount,
-          );
-        }, 1_000);
-      } catch (error: unknown) {
-        session.lastError = error instanceof Error ? error.message : String(error);
-      }
+      startSpotlightWatcher(ctx, session, intervalMs);
     }
 
     if (session.lastError) {
@@ -845,6 +882,11 @@ export default function spotlightSyncExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    try {
+      await restoreActiveSpotlightSession(ctx);
+    } catch {
+      // Status refresh below handles roots without an active spotlight state.
+    }
     await refreshSpotlightStatus(ctx);
   });
 
